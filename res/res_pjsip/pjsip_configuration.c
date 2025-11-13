@@ -2267,6 +2267,7 @@ int ast_res_pjsip_initialize_configuration(void)
 	ast_sorcery_object_field_register(sip_sorcery, "endpoint", "preferred_codec_only", "no", OPT_BOOL_T, 1, FLDSET(struct ast_sip_endpoint, preferred_codec_only));
 	ast_sorcery_object_field_register(sip_sorcery, "endpoint", "asymmetric_rtp_codec", "no", OPT_BOOL_T, 1, FLDSET(struct ast_sip_endpoint, asymmetric_rtp_codec));
 	ast_sorcery_object_field_register(sip_sorcery, "endpoint", "rtcp_mux", "no", OPT_BOOL_T, 1, FLDSET(struct ast_sip_endpoint, media.rtcp_mux));
+	ast_sorcery_object_field_register(sip_sorcery, "endpoint", "expect_no_ack", "no", OPT_BOOL_T, 1, FLDSET(struct ast_sip_endpoint, expect_no_ack));
 	ast_sorcery_object_field_register(sip_sorcery, "endpoint", "allow_overlap", "yes", OPT_BOOL_T, 1, FLDSET(struct ast_sip_endpoint, allow_overlap));
 	ast_sorcery_object_field_register(sip_sorcery, "endpoint", "overlap_context", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_endpoint, overlap_context));
 	ast_sorcery_object_field_register(sip_sorcery, "endpoint", "refer_blind_progress", "yes", OPT_BOOL_T, 1, FLDSET(struct ast_sip_endpoint, refer_blind_progress));

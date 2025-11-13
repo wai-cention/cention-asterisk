@@ -1881,6 +1881,19 @@
 						option allows the 'Q.850' Reason header to be suppressed.</para>
 					</description>
 				</configOption>
+				<configOption name="expect_no_ack" default="no">
+					<since>
+						<version>23.0.0</version>
+					</since>
+					<synopsis>Continue call without ACK if RTP stream is active</synopsis>
+					<description><para>
+						When set to "yes", this endpoint will continue the call even if
+						no ACK is received after sending a 200 OK response, as long as
+						an RTP stream is active. This is useful for handling endpoints
+						like WhatsApp that may not send ACK messages but maintain active
+						media streams.</para>
+					</description>
+				</configOption>
 				<configOption name="ignore_183_without_sdp" default="no">
 					<since>
 						<version>13.26.0</version>
