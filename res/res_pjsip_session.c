@@ -74,6 +74,7 @@ static int handle_incoming(struct ast_sip_session *session, pjsip_rx_data *rdata
 		enum ast_sip_session_response_priority response_priority);
 static void handle_outgoing_request(struct ast_sip_session *session, pjsip_tx_data *tdata);
 static void handle_outgoing_response(struct ast_sip_session *session, pjsip_tx_data *tdata);
+static int session_has_active_rtp(struct ast_sip_session *session);
 static int sip_session_refresh(struct ast_sip_session *session,
 		ast_sip_session_request_creation_cb on_request_creation,
 		ast_sip_session_sdp_creation_cb on_sdp_creation,
@@ -3416,6 +3417,13 @@ void ast_sip_session_terminate(struct ast_sip_session *session, int response)
 		}
 		break;
 	case PJSIP_INV_STATE_CONFIRMED:
+		/* Check if this endpoint expects no ACK and has active RTP before terminating */
+		if (session->endpoint && session->endpoint->expect_no_ack && session_has_active_rtp(session)) {
+			ast_debug(1, "%s: Endpoint expects no ACK and RTP is active, not terminating session\n",
+				ast_sip_session_get_name(session));
+			SCOPE_EXIT_RTN("Not terminating due to active RTP and expect_no_ack\n");
+		}
+		
 		if (session->inv_session->invite_tsx) {
 			ast_debug(3, "%s: Delay sending BYE because of outstanding transaction...\n",
 				ast_sip_session_get_name(session));
@@ -4551,6 +4559,53 @@ static int session_end_completion(void *vsession)
 	return 0;
 }
 
+/*!
+ * \internal
+ * \brief Check if RTP stream is active for a session
+ * \param session The SIP session to check
+ * \return 1 if RTP is active, 0 otherwise
+ */
+static int session_has_active_rtp(struct ast_sip_session *session)
+{
+	struct ast_sip_session_media *media;
+	int now = time(NULL);
+	int timeout;
+	
+	if (!session || !session->active_media_state) {
+		return 0;
+	}
+	
+	/* Check audio RTP stream */
+	media = session->active_media_state->default_session[AST_MEDIA_TYPE_AUDIO];
+	if (media && media->rtp) {
+		timeout = ast_rtp_instance_get_timeout(media->rtp);
+		if (timeout > 0) {
+			int elapsed = now - ast_rtp_instance_get_last_rx(media->rtp);
+			if (elapsed < timeout) {
+				ast_debug(3, "%s: Audio RTP stream is active (last RX %d seconds ago)\n",
+					ast_sip_session_get_name(session), elapsed);
+				return 1;
+			}
+		}
+	}
+	
+	/* Check video RTP stream */
+	media = session->active_media_state->default_session[AST_MEDIA_TYPE_VIDEO];
+	if (media && media->rtp) {
+		timeout = ast_rtp_instance_get_timeout(media->rtp);
+		if (timeout > 0) {
+			int elapsed = now - ast_rtp_instance_get_last_rx(media->rtp);
+			if (elapsed < timeout) {
+				ast_debug(3, "%s: Video RTP stream is active (last RX %d seconds ago)\n",
+					ast_sip_session_get_name(session), elapsed);
+				return 1;
+			}
+		}
+	}
+	
+	return 0;
+}
+
 static int check_request_status(pjsip_inv_session *inv, pjsip_event *e)
 {
 	struct ast_sip_session *session = inv->mod_data[session_module.id];
@@ -4672,6 +4727,14 @@ static void session_inv_on_state_changed(pjsip_inv_session *inv, pjsip_event *e)
 	}
 
 	if (inv->state == PJSIP_INV_STATE_DISCONNECTED) {
+		/* Check if this endpoint expects no ACK and has active RTP */
+		if (session->endpoint && session->endpoint->expect_no_ack && session_has_active_rtp(session)) {
+			ast_debug(1, "%s: Endpoint expects no ACK and RTP is active, continuing call without ACK\n",
+				ast_sip_session_get_name(session));
+			/* Don't terminate the session - let it continue */
+			SCOPE_EXIT_RTN("Continuing without ACK due to active RTP\n");
+		}
+		
 		if (session->defer_end) {
 			ast_debug(3, "%s: Deferring session end\n", ast_sip_session_get_name(session));
 			session->ended_while_deferred = 1;

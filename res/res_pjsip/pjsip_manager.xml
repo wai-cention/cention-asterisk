@@ -698,6 +698,9 @@
 				<parameter name="SuppressQ850ReasonHeaders">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='suppress_q850_reason_headers']/synopsis/node())"/></para>
 				</parameter>
+				<parameter name="ExpectNoAck">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='expect_no_ack']/synopsis/node())"/></para>
+				</parameter>
 				<parameter name="Tenantid">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='tenantid']/synopsis/node())"/></para>
 				</parameter>

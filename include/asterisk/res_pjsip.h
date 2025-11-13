@@ -1085,9 +1085,11 @@ struct ast_sip_endpoint {
 		AST_STRING_FIELD(accountcode);
 		/*! If set, we'll push incoming MWI NOTIFYs to stasis using this mailbox */
 		AST_STRING_FIELD(incoming_mwi_mailbox);
-		/*! STIR/SHAKEN profile to use */
-		AST_STRING_FIELD(stir_shaken_profile);
+	/*! STIR/SHAKEN profile to use */
+	AST_STRING_FIELD(stir_shaken_profile);
 	);
+	/*! Whether to expect ACK for incoming INVITE (for WhatsApp compatibility) */
+	unsigned int expect_no_ack;
 	/*! Configuration for extensions */
 	struct ast_sip_endpoint_extensions extensions;
 	/*! Configuration relating to media */
