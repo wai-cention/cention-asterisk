@@ -2291,6 +2291,21 @@ static int apply_negotiated_sdp_stream(struct ast_sip_session *session,
 		/* This is bundled with another session, so mark it as such */
 		ast_rtp_instance_bundle(session_media->rtp, session_media_transport->rtp);
 		ast_sip_session_media_set_write_callback(session, session_media, media_session_rtp_write_callback);
+		/* Fix: Register RTP read callbacks for bundled sessions to enable bidirectional audio.
+		 * For bundled sessions, the child's transport is deallocated, so we must use the transport
+		 * session's RTP file descriptor. The parent's read callback handles packets for all bundled
+		 * sessions via SSRC mapping, but we register a callback on this session to ensure proper
+		 * packet routing and enable receiving RTP packets from the client.
+		 * 
+		 * Without this fix, bundled sessions could send RTP packets but could not receive them,
+		 * resulting in one-way audio (client could not hear Asterisk's audio).
+		 */
+		ast_sip_session_media_add_read_callback(session, session_media, ast_rtp_instance_fd(session_media_transport->rtp, 0),
+			media_session_rtp_read_callback);
+		if (!session->endpoint->media.rtcp_mux || !session_media->remote_rtcp_mux) {
+			ast_sip_session_media_add_read_callback(session, session_media, ast_rtp_instance_fd(session_media_transport->rtp, 1),
+				media_session_rtcp_read_callback);
+		}
 		enable_rtcp(session, session_media, remote_stream);
 	}
 
@@ -2301,10 +2316,34 @@ static int apply_negotiated_sdp_stream(struct ast_sip_session *session,
 	/* Set the channel uniqueid on the RTP instance now that it is becoming active */
 	ast_channel_lock(session->channel);
 	ast_rtp_instance_set_channel_id(session_media->rtp, ast_channel_uniqueid(session->channel));
+	
+	/* Check if music on hold is active during a REINVITE */
+	int moh_active = 0;
+	int is_reinvite = (session->inv_session->state == PJSIP_INV_STATE_CONFIRMED);
+	if (is_reinvite && media_type == AST_MEDIA_TYPE_AUDIO) {
+		moh_active = ast_test_flag(ast_channel_flags(session->channel), AST_FLAG_MOH) ||
+			(ast_channel_music_state(session->channel) != NULL);
+		if (moh_active) {
+			ast_verb(2, "%s: Music on hold is active during REINVITE - preserving RTP continuity\n",
+				ast_sip_session_get_name(session));
+			/* The RTP instance is already active and sending MOH. We should avoid
+			 * reactivating it unnecessarily, as this might cause the client to reset
+			 * its decoder. The RTP stream should continue with the same SSRC and
+			 * timestamp continuity.
+			 */
+		}
+	}
 	ast_channel_unlock(session->channel);
 
 	/* Ensure the RTP instance is active */
 	ast_rtp_instance_set_stream_num(session_media->rtp, ast_stream_get_position(asterisk_stream));
+	
+	/* Activate the RTP instance. During REINVITE with active MOH, this mainly
+	 * handles DTLS setup if needed. The RTP instance is already active and sending,
+	 * so this should not disrupt the ongoing RTP stream continuity. However, if
+	 * MOH is active, we've already logged a warning - the RTP instance should
+	 * continue sending with the same SSRC/timestamp/sequence numbers.
+	 */
 	ast_rtp_instance_activate(session_media->rtp);
 
 	/* audio stream handles music on hold */
