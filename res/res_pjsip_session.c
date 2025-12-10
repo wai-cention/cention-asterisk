@@ -51,6 +51,8 @@
 #include "asterisk/test.h"
 #include "asterisk/stream.h"
 #include "asterisk/vector.h"
+#include "asterisk/bridge.h"
+#include "asterisk/channel.h"
 
 #include "res_pjsip_session/pjsip_session.h"
 
@@ -74,6 +76,7 @@ static int handle_incoming(struct ast_sip_session *session, pjsip_rx_data *rdata
 static void handle_outgoing_request(struct ast_sip_session *session, pjsip_tx_data *tdata);
 static void handle_outgoing_response(struct ast_sip_session *session, pjsip_tx_data *tdata);
 static int session_has_active_rtp(struct ast_sip_session *session);
+static void terminate_related_expect_no_ack_channels(struct ast_sip_session *session);
 static int sip_session_refresh(struct ast_sip_session *session,
 		ast_sip_session_request_creation_cb on_request_creation,
 		ast_sip_session_sdp_creation_cb on_sdp_creation,
@@ -1430,6 +1433,31 @@ static int send_delayed_request(struct ast_sip_session *session, struct ast_sip_
 		delay->active_media_state = NULL;
 		SCOPE_EXIT_RTN_VALUE(res, "%s\n", ast_sip_session_get_name(session));
 	case DELAYED_METHOD_BYE:
+		/* Check if expect_no_ack is enabled and RTP/channel is active before sending delayed BYE */
+		if (session->endpoint && session->endpoint->expect_no_ack) {
+			int rtp_active = session_has_active_rtp(session);
+			int channel_up = 0;
+			
+			/* Check if channel is active and MusicOnHold is playing */
+			if (!rtp_active && session->channel) {
+				ast_channel_lock(session->channel);
+				enum ast_channel_state chan_state = ast_channel_state(session->channel);
+				if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+					if (ast_channel_music_state(session->channel)) {
+						channel_up = 1;
+					} else if (chan_state == AST_STATE_UP) {
+						channel_up = 1;
+					}
+				}
+				ast_channel_unlock(session->channel);
+			}
+			
+			if (rtp_active || channel_up) {
+				ast_debug(1, "%s: Delayed BYE prevented due to expect_no_ack and active RTP/channel\n",
+					ast_sip_session_get_name(session));
+				SCOPE_EXIT_RTN_VALUE(0, "Not sending delayed BYE\n");
+			}
+		}
 		ast_sip_session_terminate(session, 0);
 		SCOPE_EXIT_RTN_VALUE(0, "%s: Terminating session on delayed BYE\n", ast_sip_session_get_name(session));
 	}
@@ -2613,6 +2641,77 @@ static pjsip_module session_module = {
 	.on_tx_response = session_on_tx_response,
 };
 
+/*! \brief Intercept BYE requests at transport layer to block them if expect_no_ack is enabled.
+ * 
+ * This intercepts BYE requests from INVITE timeout (Timer B), but allows BYE requests
+ * when Asterisk initiates a hangup (channel has softhangup flag set).
+ */
+static pj_status_t session_on_tx_request(pjsip_tx_data *tdata)
+{
+	pjsip_dialog *dlg = pjsip_tdata_get_dlg(tdata);
+	RAII_VAR(struct ast_sip_session *, session, dlg ? ast_sip_dialog_get_session(dlg) : NULL, ao2_cleanup);
+	
+	/* Only intercept BYE requests */
+	if (tdata->msg->line.req.method.id != PJSIP_BYE_METHOD) {
+		return PJ_SUCCESS;
+	}
+	
+	if (!session || !session->endpoint || !session->endpoint->expect_no_ack) {
+		return PJ_SUCCESS;
+	}
+	
+	/* Check if channel is being hung up by Asterisk (softhangup flag set).
+	 * If so, allow the BYE to be sent even if RTP is active.
+	 */
+	if (session->channel) {
+		ast_channel_lock(session->channel);
+		if (ast_check_hangup(session->channel)) {
+			ast_channel_unlock(session->channel);
+			ast_debug(1, "%s: BYE allowed at transport layer - channel has softhangup flag (Asterisk-initiated hangup)\n",
+				ast_sip_session_get_name(session));
+			return PJ_SUCCESS;
+		}
+		ast_channel_unlock(session->channel);
+	}
+	
+	/* Channel is not being hung up, so this BYE is likely from INVITE timeout.
+	 * Check if RTP/channel is active and block if so.
+	 */
+	int rtp_active = session_has_active_rtp(session);
+	int channel_up = 0;
+	
+	/* Check if channel is active and MusicOnHold is playing */
+	if (!rtp_active && session->channel) {
+		ast_channel_lock(session->channel);
+		enum ast_channel_state chan_state = ast_channel_state(session->channel);
+		if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+			if (ast_channel_music_state(session->channel)) {
+				channel_up = 1;
+			} else if (chan_state == AST_STATE_UP) {
+				channel_up = 1;
+			}
+		}
+		ast_channel_unlock(session->channel);
+	}
+	
+	if (rtp_active || channel_up) {
+		ast_debug(1, "%s: BYE intercepted at transport layer and blocked due to expect_no_ack and active RTP/channel (likely INVITE timeout)\n",
+			ast_sip_session_get_name(session));
+		/* Return error to prevent the BYE from being sent */
+		return PJ_ECANCELLED;
+	}
+	
+	return PJ_SUCCESS;
+}
+
+/*! \brief Module to intercept BYE requests at transport layer */
+static pjsip_module session_bye_intercept_module = {
+	.name = {"Session BYE Intercept", 20},
+	.id = -1,
+	.priority = PJSIP_MOD_PRIORITY_TSX_LAYER - 1, /* Higher priority than transaction layer */
+	.on_tx_request = session_on_tx_request,
+};
+
 /*! \brief Determine whether the SDP provided requires deferral of negotiating or not
  *
  * \retval 1 re-invite should be deferred and resumed later
@@ -2849,6 +2948,47 @@ void ast_sip_session_send_request_with_cb(struct ast_sip_session *session, pjsip
 	if (inv_session->state == PJSIP_INV_STATE_DISCONNECTED &&
 		tdata->msg->line.req.method.id != PJSIP_BYE_METHOD) {
 		return;
+	}
+
+	/* Check if this is a BYE request and expect_no_ack is enabled.
+	 * If RTP/channel is active, prevent the BYE from being sent.
+	 * However, allow BYE if channel is being hung up (softhangup flag set).
+	 */
+	if (tdata->msg->line.req.method.id == PJSIP_BYE_METHOD
+		&& session->endpoint
+		&& session->endpoint->expect_no_ack) {
+		int rtp_active = session_has_active_rtp(session);
+		int channel_up = 0;
+		int channel_hanging_up = 0;
+		
+		/* Check if channel is being hung up using softhangup flag */
+		if (session->channel) {
+			ast_channel_lock(session->channel);
+			if (ast_check_hangup(session->channel)) {
+				channel_hanging_up = 1;
+				ast_debug(1, "%s: Channel has softhangup flag set, allowing BYE request even with active RTP/channel\n",
+					ast_sip_session_get_name(session));
+			} else {
+				/* Channel is not being hung up, check if it's active */
+				enum ast_channel_state chan_state = ast_channel_state(session->channel);
+				if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+					if (ast_channel_music_state(session->channel)) {
+						channel_up = 1;
+					} else if (chan_state == AST_STATE_UP) {
+						channel_up = 1;
+					}
+				}
+			}
+			ast_channel_unlock(session->channel);
+		}
+		
+		/* Only block BYE if RTP/channel is active AND channel is not being hung up */
+		if ((rtp_active || channel_up) && !channel_hanging_up) {
+			ast_debug(1, "%s: BYE request blocked due to expect_no_ack and active RTP/channel\n",
+				ast_sip_session_get_name(session));
+			pjsip_tx_data_dec_ref(tdata);
+			return;
+		}
 	}
 
 	ast_sip_mod_data_set(tdata->pool, tdata->mod_data, session_module.id,
@@ -3480,6 +3620,49 @@ void ast_sip_session_terminate(struct ast_sip_session *session, int response)
 		SCOPE_EXIT_RTN("Deferred\n");
 	}
 
+		/* Check if this endpoint expects no ACK and has active RTP before terminating.
+		 * This check must happen early, before we start the termination process.
+		 * However, we should allow termination if the channel is being hung up (not in UP or RING state).
+		 */
+		if (session->endpoint && session->endpoint->expect_no_ack) {
+			int rtp_active = session_has_active_rtp(session);
+			int channel_up = 0;
+			int channel_hanging_up = 0;
+			
+			/* Check if channel is being hung up using softhangup flag */
+			if (session->channel) {
+				ast_channel_lock(session->channel);
+				/* Check if channel has softhangup flag set - this indicates it's being hung up */
+				if (ast_check_hangup(session->channel)) {
+					/* Channel is being hung up - allow termination */
+					channel_hanging_up = 1;
+					ast_debug(1, "%s: Channel has softhangup flag set, allowing termination even with active RTP\n",
+						ast_sip_session_get_name(session));
+				} else {
+					/* Channel is not being hung up, check if it's active */
+					enum ast_channel_state chan_state = ast_channel_state(session->channel);
+					if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+						/* Channel is still active, check if MusicOnHold is playing */
+						if (!rtp_active) {
+							if (ast_channel_music_state(session->channel)) {
+								channel_up = 1;
+							} else if (chan_state == AST_STATE_UP) {
+								channel_up = 1;
+							}
+						}
+					}
+				}
+				ast_channel_unlock(session->channel);
+			}
+			
+			/* Only block termination if RTP/channel is active AND channel is not being hung up */
+			if ((rtp_active || channel_up) && !channel_hanging_up) {
+				ast_debug(1, "%s: Session termination blocked due to expect_no_ack and active RTP/channel\n",
+					ast_sip_session_get_name(session));
+				SCOPE_EXIT_RTN("Not terminating due to active RTP/channel and expect_no_ack\n");
+			}
+		}
+
 	if (!response) {
 		response = 603;
 	}
@@ -3517,11 +3700,28 @@ void ast_sip_session_terminate(struct ast_sip_session *session, int response)
 		}
 		break;
 	case PJSIP_INV_STATE_CONFIRMED:
-		/* Check if this endpoint expects no ACK and has active RTP before terminating */
+		/* Check if this endpoint expects no ACK and has active RTP before terminating.
+		 * However, allow termination if the channel is being hung up (softhangup flag set).
+		 */
 		if (session->endpoint && session->endpoint->expect_no_ack && session_has_active_rtp(session)) {
-			ast_debug(1, "%s: Endpoint expects no ACK and RTP is active, not terminating session\n",
-				ast_sip_session_get_name(session));
-			SCOPE_EXIT_RTN("Not terminating due to active RTP and expect_no_ack\n");
+			int channel_hanging_up = 0;
+			
+			/* Check if channel is being hung up using softhangup flag */
+			if (session->channel) {
+				ast_channel_lock(session->channel);
+				if (ast_check_hangup(session->channel)) {
+					channel_hanging_up = 1;
+					ast_debug(1, "%s: Channel has softhangup flag set, allowing termination even with active RTP\n",
+						ast_sip_session_get_name(session));
+				}
+				ast_channel_unlock(session->channel);
+			}
+			
+			if (!channel_hanging_up) {
+				ast_debug(1, "%s: Endpoint expects no ACK and RTP is active, not terminating session\n",
+					ast_sip_session_get_name(session));
+				SCOPE_EXIT_RTN("Not terminating due to active RTP and expect_no_ack\n");
+			}
 		}
 		
 		if (session->inv_session->invite_tsx) {
@@ -3535,19 +3735,173 @@ void ast_sip_session_terminate(struct ast_sip_session *session, int response)
 		}
 		/* Fall through */
 	default:
-		status = pjsip_inv_end_session(session->inv_session, response, NULL, &packet);
-		if (status == PJ_SUCCESS && packet) {
-			struct ast_sip_session_delayed_request *delay;
-
-			/* Flush any delayed requests so they cannot overlap this transaction. */
-			while ((delay = AST_LIST_REMOVE_HEAD(&session->delayed_requests, next))) {
-				delayed_request_free(delay);
+		/* For CONNECTING state (and other states), check if expect_no_ack is enabled
+		 * and RTP/channel is active before sending BYE.
+		 * However, allow BYE if channel is being hung up (softhangup flag set).
+		 */
+		if (session->endpoint && session->endpoint->expect_no_ack) {
+			int rtp_active = session_has_active_rtp(session);
+			int channel_up = 0;
+			int channel_hanging_up = 0;
+			
+			/* Check if channel is being hung up using softhangup flag */
+			if (session->channel) {
+				ast_channel_lock(session->channel);
+				if (ast_check_hangup(session->channel)) {
+					channel_hanging_up = 1;
+					ast_debug(1, "%s: Channel has softhangup flag set, allowing BYE even with active RTP/channel (state=%s)\n",
+						ast_sip_session_get_name(session),
+						pjsip_inv_state_name(session->inv_session->state));
+				} else {
+					/* Channel is not being hung up, check if it's active */
+					enum ast_channel_state chan_state = ast_channel_state(session->channel);
+					if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+						if (ast_channel_music_state(session->channel)) {
+							channel_up = 1;
+							ast_debug(1, "%s: Channel is %s and MusicOnHold is active, not sending BYE\n",
+								ast_sip_session_get_name(session),
+								chan_state == AST_STATE_UP ? "UP" : "RING");
+						} else if (chan_state == AST_STATE_UP) {
+							channel_up = 1;
+							ast_debug(1, "%s: Channel is UP, not sending BYE\n",
+								ast_sip_session_get_name(session));
+						}
+					}
+				}
+				ast_channel_unlock(session->channel);
 			}
-
-			if (packet->msg->type == PJSIP_RESPONSE_MSG) {
-				ast_sip_session_send_response(session, packet);
+			
+			/* Only block BYE if RTP/channel is active AND channel is not being hung up */
+			if ((rtp_active || channel_up) && !channel_hanging_up) {
+				ast_debug(1, "%s: Endpoint expects no ACK and RTP/channel is active, not sending BYE (state=%s)\n",
+					ast_sip_session_get_name(session),
+					pjsip_inv_state_name(session->inv_session->state));
+				SCOPE_EXIT_RTN("Not sending BYE due to active RTP/channel and expect_no_ack\n");
+			}
+		}
+		
+		/* If session is already DISCONNECTED and channel is being hung up, we need to send BYE directly
+		 * because pjsip_inv_end_session won't create a BYE packet for a disconnected session.
+		 * Check this BEFORE calling pjsip_inv_end_session.
+		 * This applies to both expect_no_ack and regular endpoints.
+		 */
+		if (session->inv_session->state == PJSIP_INV_STATE_DISCONNECTED
+			&& session->inv_session->dlg) {
+			int channel_hanging_up = 0;
+			
+			/* Check if channel is being hung up using softhangup flag */
+			if (session->channel) {
+				ast_channel_lock(session->channel);
+				if (ast_check_hangup(session->channel)) {
+					channel_hanging_up = 1;
+				}
+				ast_channel_unlock(session->channel);
+			}
+			
+			if (channel_hanging_up) {
+				/* Create BYE request directly via dialog */
+				pjsip_method method;
+				pjsip_method_set(&method, PJSIP_BYE_METHOD);
+				status = pjsip_dlg_create_request(session->inv_session->dlg, &method, -1, &packet);
+				if (status == PJ_SUCCESS && packet) {
+					ast_debug(1, "%s: Session is DISCONNECTED, creating BYE directly via dialog for Asterisk-initiated hangup (expect_no_ack=%d)\n",
+						ast_sip_session_get_name(session),
+						session->endpoint ? session->endpoint->expect_no_ack : 0);
+				} else {
+					ast_debug(1, "%s: Failed to create BYE for DISCONNECTED session: status=%d, dlg=%p\n",
+						ast_sip_session_get_name(session), status, session->inv_session->dlg);
+				}
 			} else {
-				ast_sip_session_send_request(session, packet);
+				/* Channel is not hanging up, no BYE needed */
+				status = PJ_EUNKNOWN;
+				packet = NULL;
+			}
+		} else {
+			/* Session is not DISCONNECTED, use normal termination */
+			status = pjsip_inv_end_session(session->inv_session, response, NULL, &packet);
+		}
+		
+		if (status == PJ_SUCCESS && packet) {
+			/* Check again if expect_no_ack is enabled and RTP/channel is active.
+			 * This handles the case where pjsip_inv_end_session was called from
+			 * another path (e.g., INVITE timeout) and we need to prevent the BYE
+			 * from being sent even after the packet is created.
+			 * However, allow BYE if channel is being hung up (softhangup flag set).
+			 */
+			if (packet->msg->type == PJSIP_REQUEST_MSG
+				&& packet->msg->line.req.method.id == PJSIP_BYE_METHOD
+				&& session->endpoint
+				&& session->endpoint->expect_no_ack) {
+				int rtp_active = session_has_active_rtp(session);
+				int channel_up = 0;
+				int channel_hanging_up = 0;
+				
+				/* Check if channel is being hung up using softhangup flag */
+				if (session->channel) {
+					ast_channel_lock(session->channel);
+					if (ast_check_hangup(session->channel)) {
+						channel_hanging_up = 1;
+						ast_debug(1, "%s: Channel has softhangup flag set, allowing BYE packet even with active RTP/channel\n",
+							ast_sip_session_get_name(session));
+					} else {
+						/* Channel is not being hung up, check if it's active */
+						enum ast_channel_state chan_state = ast_channel_state(session->channel);
+						if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+							if (ast_channel_music_state(session->channel)) {
+								channel_up = 1;
+							} else if (chan_state == AST_STATE_UP) {
+								channel_up = 1;
+							}
+						}
+					}
+					ast_channel_unlock(session->channel);
+				}
+				
+				/* Only discard BYE if RTP/channel is active AND channel is not being hung up */
+				if ((rtp_active || channel_up) && !channel_hanging_up) {
+					ast_debug(1, "%s: BYE packet discarded due to expect_no_ack and active RTP/channel\n",
+						ast_sip_session_get_name(session));
+					pjsip_tx_data_dec_ref(packet);
+					packet = NULL;
+				}
+			}
+			
+			if (packet) {
+				struct ast_sip_session_delayed_request *delay;
+
+				/* Flush any delayed requests so they cannot overlap this transaction. */
+				while ((delay = AST_LIST_REMOVE_HEAD(&session->delayed_requests, next))) {
+					delayed_request_free(delay);
+				}
+
+				if (packet->msg->type == PJSIP_RESPONSE_MSG) {
+					ast_sip_session_send_response(session, packet);
+				} else {
+					/* If session is in CONNECTING or DISCONNECTED state and this is a BYE, send it directly via dialog
+					 * because pjsip_inv_send_msg might not transmit it when dialog isn't fully established or
+					 * when the session is already disconnected.
+					 */
+					if (packet->msg->line.req.method.id == PJSIP_BYE_METHOD
+						&& (session->inv_session->state == PJSIP_INV_STATE_CONNECTING
+							|| session->inv_session->state == PJSIP_INV_STATE_DISCONNECTED)
+						&& session->inv_session->dlg) {
+						ast_debug(1, "%s: Sending BYE directly via dialog (session state=%s, dlg=%p)\n",
+							ast_sip_session_get_name(session),
+							pjsip_inv_state_name(session->inv_session->state),
+							session->inv_session->dlg);
+						handle_outgoing_request(session, packet);
+						status = pjsip_dlg_send_request(session->inv_session->dlg, packet, -1, NULL);
+						if (status != PJ_SUCCESS) {
+							ast_debug(1, "%s: Failed to send BYE via dialog: status=%d\n",
+								ast_sip_session_get_name(session), status);
+						} else {
+							ast_debug(1, "%s: BYE successfully sent via dialog\n",
+								ast_sip_session_get_name(session));
+						}
+					} else {
+						ast_sip_session_send_request(session, packet);
+					}
+				}
 			}
 		}
 		break;
@@ -3578,6 +3932,7 @@ static void session_termination_cb(pj_timer_heap_t *timer_heap, struct pj_timer_
 		ao2_cleanup(session);
 	}
 }
+
 
 int ast_sip_session_defer_termination(struct ast_sip_session *session)
 {
@@ -4314,6 +4669,49 @@ static pj_bool_t session_on_rx_request(pjsip_rx_data *rdata)
 	SCOPE_ENTER(1, "%s Request: %.*s %s\n", ast_sip_session_get_name(session),
 		(int) pj_strlen(&req.method.name), pj_strbuf(&req.method.name), res ? req_uri : "");
 
+	/* If this is a BYE request on an established dialog and the session does NOT have expect_no_ack,
+	 * send BYE to endpoint device BEFORE pjsip processes the incoming BYE and terminates the session.
+	 * This is the earliest point we can intercept the BYE.
+	 */
+	if (req.method.id == PJSIP_BYE_METHOD && dlg && inv_session && session
+		&& session->channel && session->endpoint && !session->endpoint->expect_no_ack
+		&& inv_session->state == PJSIP_INV_STATE_CONFIRMED
+		&& inv_session->dlg) {
+		ast_channel_lock(session->channel);
+		if (!ast_check_hangup(session->channel)) {
+			ast_debug(1, "%s: Intercepting BYE in session_on_rx_request and sending BYE to endpoint device BEFORE pjsip processes it (session state=%s)\n",
+				ast_sip_session_get_name(session),
+				pjsip_inv_state_name(inv_session->state));
+			ast_softhangup_nolock(session->channel, AST_SOFTHANGUP_DEV);
+			ast_channel_unlock(session->channel);
+			
+			/* Create BYE request directly via dialog to send to endpoint device BEFORE session is terminated */
+			pjsip_method method;
+			pjsip_tx_data *bye_tdata;
+			pj_status_t status;
+			
+			pjsip_method_set(&method, PJSIP_BYE_METHOD);
+			status = pjsip_dlg_create_request(inv_session->dlg, &method, -1, &bye_tdata);
+			if (status == PJ_SUCCESS && bye_tdata) {
+				handle_outgoing_request(session, bye_tdata);
+				status = pjsip_dlg_send_request(inv_session->dlg, bye_tdata, -1, NULL);
+				if (status == PJ_SUCCESS) {
+					ast_debug(1, "%s: BYE successfully sent to endpoint device in session_on_rx_request\n",
+						ast_sip_session_get_name(session));
+				} else {
+					ast_debug(1, "%s: Failed to send BYE to endpoint device in session_on_rx_request: status=%d\n",
+						ast_sip_session_get_name(session), status);
+					pjsip_tx_data_dec_ref(bye_tdata);
+				}
+			} else {
+				ast_debug(1, "%s: Failed to create BYE for endpoint device in session_on_rx_request: status=%d, dlg=%p\n",
+					ast_sip_session_get_name(session), status, inv_session->dlg);
+			}
+		} else {
+			ast_channel_unlock(session->channel);
+		}
+	}
+
 	switch (req.method.id) {
 	case PJSIP_INVITE_METHOD:
 		if (dlg) {
@@ -4503,6 +4901,72 @@ static void handle_incoming_request(struct ast_sip_session *session, pjsip_rx_da
 	struct pjsip_request_line req = rdata->msg_info.msg->line.req;
 	SCOPE_ENTER(3, "%s: Method is %.*s\n", ast_sip_session_get_name(session), (int) pj_strlen(&req.method.name), pj_strbuf(&req.method.name));
 
+	/* If this is a BYE request and the session does NOT have expect_no_ack enabled,
+	 * check for related expect_no_ack channels and terminate them.
+	 * This handles the case where WhatsApp sends BYE to the endpoint channel instead
+	 * of the WhatsApp channel.
+	 * This is a backup to handle_incoming_before_media in case BYE requests don't go through that path.
+	 * Also, ensure the endpoint channel is properly hung up so the endpoint device receives the hangup signal.
+	 */
+	if (req.method.id == PJSIP_BYE_METHOD) {
+		ast_debug(1, "%s: BYE received in handle_incoming_request, checking for related expect_no_ack channels to terminate\n",
+			ast_sip_session_get_name(session));
+		terminate_related_expect_no_ack_channels(session);
+		
+		/* Ensure the endpoint channel is hung up and send BYE to endpoint device.
+		 * When a BYE is received from WhatsApp, we need to explicitly send a BYE to the endpoint device
+		 * to properly terminate the call. Create the BYE directly via dialog to ensure it's sent.
+		 */
+		if (session->channel && session->endpoint && !session->endpoint->expect_no_ack
+			&& session->inv_session && session->inv_session->dlg) {
+			ast_channel_lock(session->channel);
+			if (!ast_check_hangup(session->channel)) {
+				ast_debug(1, "%s: Setting softhangup flag on endpoint channel to ensure endpoint device receives hangup signal\n",
+					ast_sip_session_get_name(session));
+				ast_softhangup_nolock(session->channel, AST_SOFTHANGUP_DEV);
+				ast_channel_unlock(session->channel);
+				
+				/* Create BYE request directly via dialog to send to endpoint device.
+				 * Even if session is DISCONNECTED, we still try to send BYE to ensure endpoint device receives it.
+				 */
+				if (session->inv_session && session->inv_session->dlg) {
+					pjsip_method method;
+					pjsip_tx_data *bye_tdata;
+					pj_status_t status;
+					
+					pjsip_method_set(&method, PJSIP_BYE_METHOD);
+					status = pjsip_dlg_create_request(session->inv_session->dlg, &method, -1, &bye_tdata);
+					if (status == PJ_SUCCESS && bye_tdata) {
+						ast_debug(1, "%s: Creating BYE to send to endpoint device after receiving BYE from WhatsApp (session state=%s)\n",
+							ast_sip_session_get_name(session),
+							session->inv_session ? pjsip_inv_state_name(session->inv_session->state) : "NULL");
+						handle_outgoing_request(session, bye_tdata);
+						status = pjsip_dlg_send_request(session->inv_session->dlg, bye_tdata, -1, NULL);
+						if (status == PJ_SUCCESS) {
+							ast_debug(1, "%s: BYE successfully sent to endpoint device\n",
+								ast_sip_session_get_name(session));
+						} else {
+							ast_debug(1, "%s: Failed to send BYE to endpoint device: status=%d\n",
+								ast_sip_session_get_name(session), status);
+							pjsip_tx_data_dec_ref(bye_tdata);
+						}
+					} else {
+						ast_debug(1, "%s: Failed to create BYE for endpoint device: status=%d, dlg=%p\n",
+							ast_sip_session_get_name(session), status, 
+							session->inv_session ? session->inv_session->dlg : NULL);
+					}
+				} else {
+					ast_debug(1, "%s: Cannot send BYE to endpoint device: inv_session=%p, dlg=%p\n",
+						ast_sip_session_get_name(session),
+						session->inv_session,
+						session->inv_session ? session->inv_session->dlg : NULL);
+				}
+			} else {
+				ast_channel_unlock(session->channel);
+			}
+		}
+	}
+
 	AST_LIST_TRAVERSE(&session->supplements, supplement, next) {
 		if (supplement->incoming_request && does_method_match(&req.method.name, supplement->method)) {
 			if (supplement->incoming_request(session, rdata)) {
@@ -4586,6 +5050,54 @@ static void handle_outgoing_request(struct ast_sip_session *session, pjsip_tx_da
 	struct pjsip_request_line req = tdata->msg->line.req;
 	SCOPE_ENTER(3, "%s: Method is %.*s\n", ast_sip_session_get_name(session),
 		(int) pj_strlen(&req.method.name), pj_strbuf(&req.method.name));
+
+	/* Check if this is a BYE request and expect_no_ack is enabled.
+	 * If RTP/channel is active, prevent the BYE from being sent.
+	 * This intercepts BYE requests that come from pjsip_inv_end_session
+	 * and are sent via ast_sip_session_send_request -> handle_outgoing_request.
+	 * However, allow BYE if channel is being hung up (softhangup flag set).
+	 */
+	if (req.method.id == PJSIP_BYE_METHOD
+		&& session->endpoint
+		&& session->endpoint->expect_no_ack) {
+		int rtp_active = session_has_active_rtp(session);
+		int channel_up = 0;
+		int channel_hanging_up = 0;
+		
+		/* Check if channel is being hung up using softhangup flag */
+		if (session->channel) {
+			ast_channel_lock(session->channel);
+			if (ast_check_hangup(session->channel)) {
+				channel_hanging_up = 1;
+				ast_debug(1, "%s: BYE intercepted in handle_outgoing_request: Channel has softhangup flag set, allowing BYE even with active RTP/channel\n",
+					ast_sip_session_get_name(session));
+			} else {
+				/* Channel is not being hung up, check if it's active */
+				enum ast_channel_state chan_state = ast_channel_state(session->channel);
+				if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+					if (ast_channel_music_state(session->channel)) {
+						channel_up = 1;
+						ast_debug(1, "%s: BYE intercepted in handle_outgoing_request: Channel is %s and MusicOnHold is active, blocking BYE\n",
+							ast_sip_session_get_name(session),
+							chan_state == AST_STATE_UP ? "UP" : "RING");
+					} else if (chan_state == AST_STATE_UP) {
+						channel_up = 1;
+						ast_debug(1, "%s: BYE intercepted in handle_outgoing_request: Channel is UP, blocking BYE\n",
+							ast_sip_session_get_name(session));
+					}
+				}
+			}
+			ast_channel_unlock(session->channel);
+		}
+		
+		/* Only block BYE if RTP/channel is active AND channel is not being hung up */
+		if ((rtp_active || channel_up) && !channel_hanging_up) {
+			ast_debug(1, "%s: BYE intercepted in handle_outgoing_request and blocked due to expect_no_ack and active RTP/channel\n",
+				ast_sip_session_get_name(session));
+			pjsip_tx_data_dec_ref(tdata);
+			SCOPE_EXIT_RTN("BYE blocked in handle_outgoing_request\n");
+		}
+	}
 
 	ast_sip_message_apply_transport(session->endpoint->transport, tdata);
 
@@ -4672,6 +5184,8 @@ static int session_has_active_rtp(struct ast_sip_session *session)
 	int timeout;
 	
 	if (!session || !session->active_media_state) {
+		ast_debug(1, "%s: session_has_active_rtp: no session or active_media_state\n",
+			ast_sip_session_get_name(session));
 		return 0;
 	}
 	
@@ -4679,14 +5193,46 @@ static int session_has_active_rtp(struct ast_sip_session *session)
 	media = session->active_media_state->default_session[AST_MEDIA_TYPE_AUDIO];
 	if (media && media->rtp) {
 		timeout = ast_rtp_instance_get_timeout(media->rtp);
+		ast_debug(1, "%s: session_has_active_rtp: audio media exists, timeout=%d\n",
+			ast_sip_session_get_name(session), timeout);
 		if (timeout > 0) {
-			int elapsed = now - ast_rtp_instance_get_last_rx(media->rtp);
+			int last_rx = ast_rtp_instance_get_last_rx(media->rtp);
+			int elapsed = now - last_rx;
+			ast_debug(1, "%s: session_has_active_rtp: now=%d, last_rx=%d, elapsed=%d, timeout=%d\n",
+				ast_sip_session_get_name(session), now, last_rx, elapsed, timeout);
 			if (elapsed < timeout) {
-				ast_debug(3, "%s: Audio RTP stream is active (last RX %d seconds ago)\n",
+				ast_debug(1, "%s: Audio RTP stream is active (last RX %d seconds ago)\n",
 					ast_sip_session_get_name(session), elapsed);
 				return 1;
+			} else {
+				/* For expect_no_ack endpoints, be more lenient - if RTP has been received
+				 * at all (last_rx > 0) and elapsed is reasonable (< 60 seconds), consider it active.
+				 * This handles cases where the timeout might be too short or there's a brief gap.
+				 */
+				if (session->endpoint && session->endpoint->expect_no_ack && last_rx > 0 && elapsed < 60) {
+					ast_debug(1, "%s: Audio RTP stream considered active for expect_no_ack (last RX %d seconds ago, timeout %d)\n",
+						ast_sip_session_get_name(session), elapsed, timeout);
+					return 1;
+				}
+				ast_debug(1, "%s: Audio RTP stream NOT active (elapsed %d >= timeout %d)\n",
+					ast_sip_session_get_name(session), elapsed, timeout);
 			}
+		} else {
+			/* If timeout is 0 or negative (disabled), check if RTP has been received at all */
+			if (session->endpoint && session->endpoint->expect_no_ack) {
+				int last_rx = ast_rtp_instance_get_last_rx(media->rtp);
+				if (last_rx > 0) {
+					ast_debug(1, "%s: Audio RTP stream considered active for expect_no_ack (timeout disabled, last_rx=%d)\n",
+						ast_sip_session_get_name(session), last_rx);
+					return 1;
+				}
+			}
+			ast_debug(1, "%s: session_has_active_rtp: timeout is %d (not > 0)\n",
+				ast_sip_session_get_name(session), timeout);
 		}
+	} else {
+		ast_debug(1, "%s: session_has_active_rtp: no audio media (media=%p, rtp=%p)\n",
+			ast_sip_session_get_name(session), media, media ? media->rtp : NULL);
 	}
 	
 	/* Check video RTP stream */
@@ -4696,7 +5242,7 @@ static int session_has_active_rtp(struct ast_sip_session *session)
 		if (timeout > 0) {
 			int elapsed = now - ast_rtp_instance_get_last_rx(media->rtp);
 			if (elapsed < timeout) {
-				ast_debug(3, "%s: Video RTP stream is active (last RX %d seconds ago)\n",
+				ast_debug(1, "%s: Video RTP stream is active (last RX %d seconds ago)\n",
 					ast_sip_session_get_name(session), elapsed);
 				return 1;
 			}
@@ -4729,6 +5275,89 @@ static int check_request_status(pjsip_inv_session *inv, pjsip_event *e)
 	return 1;
 }
 
+/*! \brief Terminate related expect_no_ack channels when a BYE is received on a non-expect_no_ack channel.
+ *
+ * When WhatsApp sends a BYE to the endpoint channel (instead of the WhatsApp channel),
+ * we need to also terminate the related WhatsApp channel that has expect_no_ack enabled.
+ * Since channels may be in different bridges, we iterate through all active PJSIP channels
+ * with expect_no_ack that are in CONFIRMED state and terminate them.
+ */
+static void terminate_related_expect_no_ack_channels(struct ast_sip_session *session)
+{
+	struct ast_channel_iterator *iter;
+	struct ast_channel *chan;
+	
+	/* Only process if this session does NOT have expect_no_ack enabled */
+	if (!session->channel || !session->endpoint || session->endpoint->expect_no_ack) {
+		return;
+	}
+	
+	ast_debug(1, "%s: Checking for related expect_no_ack channels to terminate due to incoming BYE\n",
+		ast_sip_session_get_name(session));
+	
+	/* Iterate through all active channels */
+	iter = ast_channel_iterator_all_new();
+	if (!iter) {
+		return;
+	}
+	
+	while ((chan = ast_channel_iterator_next(iter))) {
+		/* Skip the current channel */
+		if (chan == session->channel) {
+			ast_channel_unref(chan);
+			continue;
+		}
+		
+		/* Check if this is a PJSIP channel */
+		if (!ast_channel_tech(chan) || strncmp(ast_channel_tech(chan)->type, "PJSIP", 5) != 0) {
+			ast_channel_unref(chan);
+			continue;
+		}
+		
+		/* Get the session from the channel */
+		ast_channel_lock(chan);
+		if (ast_channel_tech_pvt(chan)) {
+			struct ast_sip_channel_pvt *channel_pvt = (struct ast_sip_channel_pvt *)ast_channel_tech_pvt(chan);
+			if (channel_pvt && channel_pvt->session) {
+				struct ast_sip_session *related_session = channel_pvt->session;
+				
+				/* Check if this session has expect_no_ack enabled and is in a bridge (indicating it's part of an active call) */
+				if (related_session->endpoint && related_session->endpoint->expect_no_ack) {
+					/* Check if the channel is in a bridge */
+					struct ast_bridge *related_bridge = ast_channel_get_bridge(chan);
+					if (related_bridge) {
+						ao2_ref(related_bridge, -1);
+						/* Only terminate if session is still active (not already disconnected) */
+						if (related_session->inv_session 
+							&& related_session->inv_session->state != PJSIP_INV_STATE_NULL
+							&& related_session->inv_session->state != PJSIP_INV_STATE_DISCONNECTED) {
+							ast_debug(1, "%s: Terminating related expect_no_ack channel %s (state=%s) due to incoming BYE\n",
+								ast_sip_session_get_name(session),
+								ast_sip_session_get_name(related_session),
+								pjsip_inv_state_name(related_session->inv_session->state));
+							
+							/* Set softhangup flag to allow termination even with active RTP */
+							ast_softhangup_nolock(chan, AST_SOFTHANGUP_DEV);
+							
+							/* Terminate the session */
+							ast_sip_session_terminate(related_session, 0);
+						} else {
+							ast_debug(1, "%s: Related expect_no_ack channel %s is already disconnected (state=%s), skipping\n",
+								ast_sip_session_get_name(session),
+								ast_sip_session_get_name(related_session),
+								related_session->inv_session ? pjsip_inv_state_name(related_session->inv_session->state) : "NULL");
+						}
+					}
+				}
+			}
+		}
+		ast_channel_unlock(chan);
+		ast_channel_unref(chan);
+	}
+	
+	ast_channel_iterator_destroy(iter);
+}
+
 static void handle_incoming_before_media(pjsip_inv_session *inv,
 	struct ast_sip_session *session, pjsip_rx_data *rdata)
 {
@@ -4736,9 +5365,86 @@ static void handle_incoming_before_media(pjsip_inv_session *inv,
 	ast_debug(3, "%s: Received %s\n", ast_sip_session_get_name(session), rdata->msg_info.msg->type == PJSIP_REQUEST_MSG ?
 			"request" : "response");
 
+	msg = rdata->msg_info.msg;
+	
+	/* Note: We always honor incoming BYE requests from the remote party, even if
+	 * expect_no_ack is enabled. The expect_no_ack flag only prevents Asterisk from
+	 * sending BYE due to INVITE transaction timeout, not from honoring BYE requests
+	 * from the remote party.
+	 */
+
+	/* If this is a BYE request and the session does NOT have expect_no_ack enabled,
+	 * send BYE to endpoint device BEFORE processing the incoming BYE to ensure
+	 * it's sent before the session is terminated.
+	 * This is the earliest point we can intercept the BYE in the invite session callback chain.
+	 */
+	if (msg->type == PJSIP_REQUEST_MSG
+		&& msg->line.req.method.id == PJSIP_BYE_METHOD
+		&& session->channel && session->endpoint && !session->endpoint->expect_no_ack
+		&& session->inv_session && session->inv_session->dlg) {
+		/* Check session state - if it's still CONFIRMED, we can send the BYE now */
+		if (session->inv_session->state == PJSIP_INV_STATE_CONFIRMED) {
+			ast_channel_lock(session->channel);
+			if (!ast_check_hangup(session->channel)) {
+				ast_debug(1, "%s: Sending BYE to endpoint device BEFORE processing incoming BYE (session state=CONFIRMED)\n",
+					ast_sip_session_get_name(session));
+				ast_softhangup_nolock(session->channel, AST_SOFTHANGUP_DEV);
+				ast_channel_unlock(session->channel);
+				
+				/* Create BYE request directly via dialog to send to endpoint device BEFORE session is terminated */
+				pjsip_method method;
+				pjsip_tx_data *bye_tdata;
+				pj_status_t status;
+				
+				pjsip_method_set(&method, PJSIP_BYE_METHOD);
+				status = pjsip_dlg_create_request(session->inv_session->dlg, &method, -1, &bye_tdata);
+				if (status == PJ_SUCCESS && bye_tdata) {
+					handle_outgoing_request(session, bye_tdata);
+					status = pjsip_dlg_send_request(session->inv_session->dlg, bye_tdata, -1, NULL);
+					if (status == PJ_SUCCESS) {
+						ast_debug(1, "%s: BYE successfully sent to endpoint device BEFORE processing incoming BYE\n",
+							ast_sip_session_get_name(session));
+					} else {
+						ast_debug(1, "%s: Failed to send BYE to endpoint device: status=%d\n",
+							ast_sip_session_get_name(session), status);
+						pjsip_tx_data_dec_ref(bye_tdata);
+					}
+				} else {
+					ast_debug(1, "%s: Failed to create BYE for endpoint device: status=%d, dlg=%p\n",
+						ast_sip_session_get_name(session), status, session->inv_session->dlg);
+				}
+			} else {
+				ast_channel_unlock(session->channel);
+			}
+		} else {
+			/* Session is not CONFIRMED, but we still need to send BYE. Set softhangup flag
+			 * so that ast_sip_session_terminate will send the BYE when called.
+			 */
+			ast_channel_lock(session->channel);
+			if (!ast_check_hangup(session->channel)) {
+				ast_debug(1, "%s: Setting softhangup flag (session state=%s) - BYE will be sent by ast_sip_session_terminate\n",
+					ast_sip_session_get_name(session),
+					session->inv_session ? pjsip_inv_state_name(session->inv_session->state) : "NULL");
+				ast_softhangup_nolock(session->channel, AST_SOFTHANGUP_DEV);
+			}
+			ast_channel_unlock(session->channel);
+		}
+	}
 
 	handle_incoming(session, rdata, AST_SIP_SESSION_BEFORE_MEDIA);
-	msg = rdata->msg_info.msg;
+	
+	/* If this is a BYE request and the session does NOT have expect_no_ack enabled,
+	 * check for related expect_no_ack channels and terminate them.
+	 * This handles the case where WhatsApp sends BYE to the endpoint channel instead
+	 * of the WhatsApp channel.
+	 */
+	if (msg->type == PJSIP_REQUEST_MSG
+		&& msg->line.req.method.id == PJSIP_BYE_METHOD) {
+		ast_debug(1, "%s: BYE received, checking for related expect_no_ack channels to terminate\n",
+			ast_sip_session_get_name(session));
+		terminate_related_expect_no_ack_channels(session);
+	}
+	
 	if (msg->type == PJSIP_REQUEST_MSG
 		&& msg->line.req.method.id == PJSIP_ACK_METHOD
 		&& pjmedia_sdp_neg_get_state(inv->neg) != PJMEDIA_SDP_NEG_STATE_DONE) {
@@ -4828,11 +5534,48 @@ static void session_inv_on_state_changed(pjsip_inv_session *inv, pjsip_event *e)
 
 	if (inv->state == PJSIP_INV_STATE_DISCONNECTED) {
 		/* Check if this endpoint expects no ACK and has active RTP */
-		if (session->endpoint && session->endpoint->expect_no_ack && session_has_active_rtp(session)) {
-			ast_debug(1, "%s: Endpoint expects no ACK and RTP is active, continuing call without ACK\n",
-				ast_sip_session_get_name(session));
-			/* Don't terminate the session - let it continue */
-			SCOPE_EXIT_RTN("Continuing without ACK due to active RTP\n");
+		if (session) {
+			ast_debug(1, "%s: Session state is DISCONNECTED, checking expect_no_ack. session=%p, endpoint=%p, expect_no_ack=%d\n",
+				ast_sip_session_get_name(session), session, session->endpoint,
+				session->endpoint ? session->endpoint->expect_no_ack : 0);
+			if (session->endpoint && session->endpoint->expect_no_ack) {
+				int rtp_active = session_has_active_rtp(session);
+				int channel_up = 0;
+				
+				ast_debug(1, "%s: expect_no_ack is enabled, RTP active=%d\n",
+					ast_sip_session_get_name(session), rtp_active);
+				
+				/* If media state is NULL, check if channel is still active (UP or RING) as a fallback.
+				 * Also check if MusicOnHold is active, which indicates the call should continue.
+				 */
+				if (!rtp_active && session->channel) {
+					ast_channel_lock(session->channel);
+					enum ast_channel_state chan_state = ast_channel_state(session->channel);
+					/* Check if channel is UP (answered) or RING (ringing but not answered yet) */
+					if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+						/* Also check if MusicOnHold is active */
+						if (ast_channel_music_state(session->channel)) {
+							channel_up = 1;
+							ast_debug(1, "%s: Channel is %s and MusicOnHold is active, considering RTP active\n",
+								ast_sip_session_get_name(session),
+								chan_state == AST_STATE_UP ? "UP" : "RING");
+						} else if (chan_state == AST_STATE_UP) {
+							/* If channel is UP, consider it active even without MusicOnHold */
+							channel_up = 1;
+							ast_debug(1, "%s: Channel is UP, considering RTP active\n",
+								ast_sip_session_get_name(session));
+						}
+					}
+					ast_channel_unlock(session->channel);
+				}
+				
+				if (rtp_active || channel_up) {
+					ast_debug(1, "%s: Endpoint expects no ACK and RTP/channel is active, continuing call without ACK\n",
+						ast_sip_session_get_name(session));
+					/* Don't terminate the session - let it continue */
+					SCOPE_EXIT_RTN("Continuing without ACK due to active RTP/channel\n");
+				}
+			}
 		}
 		
 		if (session->defer_end) {
@@ -4840,6 +5583,7 @@ static void session_inv_on_state_changed(pjsip_inv_session *inv, pjsip_event *e)
 			session->ended_while_deferred = 1;
 			SCOPE_EXIT_RTN("Deferring\n");
 		}
+
 
 		if (ast_sip_push_task(session->serializer, session_end, session)) {
 			/* Do it anyway even though this is not the right thread. */
@@ -4869,7 +5613,56 @@ static int session_end_if_disconnected(int id, pjsip_inv_session *inv)
 	 */
 	pjsip_dlg_inc_lock(inv->dlg);
 	session = inv->mod_data[id];
-	inv->mod_data[id] = NULL;
+	pjsip_dlg_dec_lock(inv->dlg);
+
+	/*
+	 * Check if this endpoint expects no ACK and has active RTP.
+	 * If so, don't end the session - let it continue without ACK.
+	 * Also check if the channel is still UP (which indicates the call is active).
+	 */
+	if (session && session->endpoint && session->endpoint->expect_no_ack) {
+		int rtp_active = session_has_active_rtp(session);
+		int channel_up = 0;
+		
+				/* If media state is NULL, check if channel is still active (UP or RING) as a fallback.
+				 * Also check if MusicOnHold is active, which indicates the call should continue.
+				 */
+				if (!rtp_active && session->channel) {
+					ast_channel_lock(session->channel);
+					enum ast_channel_state chan_state = ast_channel_state(session->channel);
+					/* Check if channel is UP (answered) or RING (ringing but not answered yet) */
+					if (chan_state == AST_STATE_UP || chan_state == AST_STATE_RING) {
+						/* Also check if MusicOnHold is active */
+						if (ast_channel_music_state(session->channel)) {
+							channel_up = 1;
+							ast_debug(1, "%s: Channel is %s and MusicOnHold is active, considering RTP active\n",
+								ast_sip_session_get_name(session),
+								chan_state == AST_STATE_UP ? "UP" : "RING");
+						} else if (chan_state == AST_STATE_UP) {
+							/* If channel is UP, consider it active even without MusicOnHold */
+							channel_up = 1;
+							ast_debug(1, "%s: Channel is UP, considering RTP active\n",
+								ast_sip_session_get_name(session));
+						}
+					}
+					ast_channel_unlock(session->channel);
+				}
+		
+		if (rtp_active || channel_up) {
+			ast_debug(1, "%s: Endpoint expects no ACK and RTP/channel is active, not ending session\n",
+				ast_sip_session_get_name(session));
+			return 0;
+		}
+	}
+
+	/*
+	 * We are locking again because we need to clear the mod_data
+	 * and we may have released the lock above.
+	 */
+	pjsip_dlg_inc_lock(inv->dlg);
+	if (inv->mod_data[id] == session) {
+		inv->mod_data[id] = NULL;
+	}
 	pjsip_dlg_dec_lock(inv->dlg);
 
 	/*
@@ -4906,6 +5699,53 @@ static void session_inv_on_tsx_state_changed(pjsip_inv_session *inv, pjsip_trans
 		SCOPE_EXIT_RTN("Session ended\n");
 	}
 
+
+	/*
+	 * For incoming INVITE transactions (UAS role), if the transaction times out
+	 * (no ACK received after 200 OK) while the state is still CONNECTING, check
+	 * if expect_no_ack is enabled and RTP is active. If so, prevent the state
+	 * from transitioning to DISCONNECTED. This check must happen BEFORE
+	 * session_end_if_disconnected to prevent premature session termination.
+	 */
+	if (tsx->method.id == PJSIP_INVITE_METHOD
+		&& tsx->role == PJSIP_ROLE_UAS
+		&& tsx->state == PJSIP_TSX_STATE_TERMINATED
+		&& inv->state == PJSIP_INV_STATE_CONNECTING) {
+		ast_debug(1, "%s: INVITE transaction terminated in CONNECTING state, checking expect_no_ack. session=%p\n",
+			ast_sip_session_get_name(session), session);
+		if (session) {
+			ast_debug(1, "%s: session exists, endpoint=%p\n",
+				ast_sip_session_get_name(session), session->endpoint);
+			if (session->endpoint) {
+				ast_debug(1, "%s: endpoint exists, expect_no_ack=%d\n",
+					ast_sip_session_get_name(session), session->endpoint->expect_no_ack);
+				if (session->endpoint->expect_no_ack) {
+					int rtp_active = session_has_active_rtp(session);
+					ast_debug(1, "%s: expect_no_ack is enabled, RTP active=%d\n",
+						ast_sip_session_get_name(session), rtp_active);
+					if (rtp_active) {
+						ast_debug(1, "%s: INVITE transaction timed out (no ACK), but expect_no_ack is enabled and RTP is active, preventing disconnect\n",
+							ast_sip_session_get_name(session));
+						/* Don't let pjproject move the state to DISCONNECTED - keep it in CONNECTING */
+						SCOPE_EXIT_RTN("Preventing disconnect due to active RTP and expect_no_ack\n");
+					} else {
+						ast_debug(1, "%s: expect_no_ack enabled but RTP not active, allowing disconnect\n",
+							ast_sip_session_get_name(session));
+					}
+				} else {
+					ast_debug(1, "%s: expect_no_ack not enabled on endpoint\n",
+						ast_sip_session_get_name(session));
+				}
+			} else {
+				ast_debug(1, "%s: session has no endpoint\n",
+					ast_sip_session_get_name(session));
+			}
+		} else {
+			ast_debug(1, "%s: session is NULL when INVITE transaction terminated\n",
+				ast_sip_session_get_name(session));
+		}
+	}
+
 	/*
 	 * If the session is disconnected really nothing else to do unless currently transacting
 	 * a BYE. If a BYE then hold off destruction until the transaction timeout occurs. This
@@ -4927,6 +5767,24 @@ static void session_inv_on_tsx_state_changed(pjsip_inv_session *inv, pjsip_trans
 		break;
 	case PJSIP_EVENT_RX_MSG:
 		cb = ast_sip_mod_data_get(tsx->mod_data, id, MOD_DATA_ON_RESPONSE);
+		
+		/* If this is an incoming BYE request and the session does NOT have expect_no_ack enabled,
+		 * set the softhangup flag to trigger channel hangup.
+		 * See WHATSAPP_ISSUES.md for details on WhatsApp's non-standard BYE routing behavior.
+		 */
+		if (tsx->method.id == PJSIP_BYE_METHOD
+			&& e->body.tsx_state.src.rdata && e->body.tsx_state.src.rdata->msg_info.msg->type == PJSIP_REQUEST_MSG
+			&& session && session->channel && session->endpoint && !session->endpoint->expect_no_ack
+			&& inv->state == PJSIP_INV_STATE_CONFIRMED) {
+			ast_channel_lock(session->channel);
+			if (!ast_check_hangup(session->channel)) {
+				ast_debug(1, "%s: Setting softhangup flag due to incoming BYE (WhatsApp non-standard BYE routing - see code comments)\n",
+					ast_sip_session_get_name(session));
+				ast_softhangup_nolock(session->channel, AST_SOFTHANGUP_DEV);
+			}
+			ast_channel_unlock(session->channel);
+		}
+		
 		/* As the PJSIP invite session implementation responds with a 200 OK before we have a
 		 * chance to be invoked session supplements for BYE requests actually end up executing
 		 * in the invite session state callback as well. To prevent session supplements from
@@ -6303,6 +7161,7 @@ static int load_module(void)
 	}
 	ast_sip_register_service(&session_reinvite_module);
 	ast_sip_register_service(&outbound_invite_auth_module);
+	ast_sip_register_service(&session_bye_intercept_module);
 
 	pjsip_reason_header_load();
 
@@ -6322,6 +7181,7 @@ static int unload_module(void)
 #endif
 	ast_sip_unregister_service(&outbound_invite_auth_module);
 	ast_sip_unregister_service(&session_reinvite_module);
+	ast_sip_unregister_service(&session_bye_intercept_module);
 	ast_sip_unregister_service(&session_module);
 	ast_sorcery_delete(ast_sip_get_sorcery(), nat_hook);
 	ao2_cleanup(nat_hook);

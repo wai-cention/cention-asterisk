@@ -231,6 +231,8 @@ struct ast_sip_session {
 	unsigned int defer_end:1;
 	/*! Session end (remote hangup) requested while termination deferred */
 	unsigned int ended_while_deferred:1;
+	/*! Whether to ignore BYE requests when expect_no_ack is enabled and RTP is active */
+	unsigned int ignore_bye:1;
 	/*! Whether to pass through hold and unhold using re-invites with recvonly and sendrecv */
 	unsigned int moh_passthrough:1;
 	/*! Whether early media state has been confirmed through PRACK */

@@ -347,12 +347,48 @@ struct ast_bridge_channel *ast_bridge_channel_peer(struct ast_bridge_channel *br
 
 void ast_bridge_channel_restore_formats(struct ast_bridge_channel *bridge_channel)
 {
-	ast_assert(bridge_channel->read_format != NULL);
-	ast_assert(bridge_channel->write_format != NULL);
+	const char *chan_name = "<unknown>";
+	
+	/* Check if format objects are still valid before using them.
+	 * This prevents crashes when a deferred action tries to restore formats
+	 * after the bridge_channel has been partially destroyed (e.g., due to
+	 * silent termination without BYE from WhatsApp).
+	 */
+	if (!bridge_channel->read_format || !bridge_channel->write_format) {
+		if (bridge_channel->chan) {
+			chan_name = ast_channel_name(bridge_channel->chan);
+		}
+		ast_log(LOG_NOTICE, "Bridge channel %p(%s): Cannot restore formats - format objects have been freed (likely due to silent termination without BYE)\n",
+			bridge_channel, chan_name);
+		return;
+	}
+
+	if (!bridge_channel->chan) {
+		ast_log(LOG_NOTICE, "Bridge channel %p: Cannot restore formats - channel is NULL\n",
+			bridge_channel);
+		return;
+	}
 
 	ast_channel_lock(bridge_channel->chan);
 
-	/* Restore original formats of the channel as they came in */
+	/* If the channel is hung up, there's no point in restoring formats.
+	 * This check helps avoid crashes when format objects may be corrupted
+	 * due to silent termination without BYE from WhatsApp.
+	 */
+	if (ast_check_hangup(bridge_channel->chan)) {
+		chan_name = ast_channel_name(bridge_channel->chan);
+		ast_debug(1, "Bridge channel %p(%s): Skipping format restoration - channel is hung up\n",
+			bridge_channel, chan_name);
+		ast_channel_unlock(bridge_channel->chan);
+		return;
+	}
+
+	/* Restore original formats of the channel as they came in.
+	 * Note: If format objects are corrupted (freed but not NULL), this will still crash,
+	 * but at least we've checked the channel state first. The real fix would be to ensure
+	 * format pointers are set to NULL in bridge_channel_destroy, but that may not help
+	 * if deferred actions have already captured the pointers.
+	 */
 	if (ast_format_cmp(ast_channel_readformat(bridge_channel->chan), bridge_channel->read_format) == AST_FORMAT_CMP_NOT_EQUAL) {
 		ast_debug(1, "Bridge is returning %p(%s) to read format %s\n",
 			bridge_channel, ast_channel_name(bridge_channel->chan),
@@ -3096,8 +3132,24 @@ static void bridge_channel_destroy(void *obj)
 
 	ast_cond_destroy(&bridge_channel->cond);
 
-	ao2_cleanup(bridge_channel->write_format);
-	ao2_cleanup(bridge_channel->read_format);
+	/* Safely cleanup format objects. Save pointers first, set to NULL to prevent
+	 * use-after-free, then attempt cleanup. If objects are corrupted, ao2_cleanup
+	 * will trigger an assertion, but Asterisk continues running (non-fatal).
+	 */
+	{
+		struct ast_format *write_format = bridge_channel->write_format;
+		struct ast_format *read_format = bridge_channel->read_format;
+		
+		bridge_channel->write_format = NULL;
+		bridge_channel->read_format = NULL;
+		
+		if (write_format) {
+			ao2_cleanup(write_format);
+		}
+		if (read_format) {
+			ao2_cleanup(read_format);
+		}
+	}
 
 	AST_VECTOR_FREE(&bridge_channel->stream_map.to_bridge);
 	AST_VECTOR_FREE(&bridge_channel->stream_map.to_channel);

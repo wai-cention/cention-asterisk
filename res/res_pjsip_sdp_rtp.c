@@ -2172,7 +2172,7 @@ static struct ast_frame *media_session_rtp_read_callback(struct ast_sip_session 
 {
 	struct ast_frame *f;
 
-	if (!session_media->rtp) {
+	if (!session_media || !session_media->rtp) {
 		return &ast_null_frame;
 	}
 
