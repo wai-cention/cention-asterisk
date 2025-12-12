@@ -701,6 +701,18 @@
 				<parameter name="ExpectNoAck">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='expect_no_ack']/synopsis/node())"/></para>
 				</parameter>
+				<parameter name="RtpDisconnectDetection">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='rtp_disconnect_detection']/synopsis/node())"/></para>
+				</parameter>
+				<parameter name="RtpDisconnectRateThreshold">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='rtp_disconnect_rate_threshold']/synopsis/node())"/></para>
+				</parameter>
+				<parameter name="RtpDisconnectDuration">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='rtp_disconnect_duration']/synopsis/node())"/></para>
+				</parameter>
+				<parameter name="RtpDisconnectWindow">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='rtp_disconnect_window']/synopsis/node())"/></para>
+				</parameter>
 				<parameter name="Tenantid">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='tenantid']/synopsis/node())"/></para>
 				</parameter>

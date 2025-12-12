@@ -2168,9 +2168,48 @@ static int create_outgoing_sdp_stream(struct ast_sip_session *session, struct as
 	SCOPE_EXIT_RTN_VALUE(1, "RC: 1\n");
 }
 
+/*!
+ * \brief Update RTP disconnect detection frame rate statistics
+ * 
+ * This function records VOICE frame timestamps in a circular buffer
+ * to track frame reception rate for disconnect detection.
+ */
+static void update_rtp_disconnect_stats(struct ast_sip_session *session, time_t frame_time)
+{
+	struct rtp_disconnect_stats *stats;
+	time_t window_start;
+	unsigned int i;
+	unsigned int valid_frames = 0;
+
+	if (!session || !session->endpoint || !session->endpoint->rtp_disconnect_detection) {
+		return;
+	}
+
+	stats = &session->rtp_disconnect;
+	if (!stats->enabled || !stats->active || !stats->frame_timestamps) {
+		return;
+	}
+
+	/* Record this frame timestamp in the circular buffer */
+	stats->frame_timestamps[stats->window_index] = frame_time;
+	stats->window_index = (stats->window_index + 1) % stats->window_size;
+	stats->last_voice_frame_time = frame_time;
+
+	/* Calculate how many frames are within the window */
+	window_start = frame_time - stats->window_seconds;
+	for (i = 0; i < stats->window_size; i++) {
+		/* Only count non-zero timestamps (initialized entries) within the window */
+		if (stats->frame_timestamps[i] > 0 && stats->frame_timestamps[i] >= window_start) {
+			valid_frames++;
+		}
+	}
+	stats->frame_count = valid_frames;
+}
+
 static struct ast_frame *media_session_rtp_read_callback(struct ast_sip_session *session, struct ast_sip_session_media *session_media)
 {
 	struct ast_frame *f;
+	time_t now;
 
 	if (!session_media || !session_media->rtp) {
 		return &ast_null_frame;
@@ -2181,7 +2220,13 @@ static struct ast_frame *media_session_rtp_read_callback(struct ast_sip_session 
 		return NULL;
 	}
 
-	ast_rtp_instance_set_last_rx(session_media->rtp, time(NULL));
+	now = time(NULL);
+	ast_rtp_instance_set_last_rx(session_media->rtp, now);
+
+	/* Track VOICE frames for disconnect detection */
+	if (f->frametype == AST_FRAME_VOICE) {
+		update_rtp_disconnect_stats(session, now);
+	}
 
 	return f;
 }

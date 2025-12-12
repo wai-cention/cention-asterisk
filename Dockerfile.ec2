@@ -1,0 +1,173 @@
+FROM amazonlinux:2023
+
+# Install runtime dependencies including sngrep dependencies
+RUN dnf update -y && \
+    dnf install -y \
+    libuuid \
+    libsndfile \
+    speex \
+    opus \
+    libvorbis \
+    libogg \
+    libsamplerate \
+    lua \
+    python3 \
+    nodejs \
+    alsa-lib \
+    gsm-devel \
+    postgresql15 \
+    libpq \
+    libpq-devel \
+    unixODBC \
+    shadow-utils \
+    vim \
+    jansson \
+    libedit \
+    procps-ng \
+    telnet \
+    openssh-clients \
+    iputils \
+    less \
+    openssl \
+    ncurses \
+    libpcap \
+    libibverbs \
+    libnl3 \
+    && \
+    # Try to install PostgreSQL ODBC driver (package name may vary)
+    (dnf install -y postgresql-odbc 2>/dev/null || \
+     dnf install -y psqlodbc 2>/dev/null || \
+     echo "WARNING: PostgreSQL ODBC driver package not found in default repos") && \
+    dnf clean all
+
+# Create asterisk user
+RUN useradd -r -s /bin/false asterisk
+
+# Copy Asterisk binaries
+COPY asterisk /usr/sbin/asterisk
+COPY safe_asterisk /usr/sbin/safe_asterisk
+# Create rasterisk as a symlink to asterisk (rasterisk is just asterisk in remote console mode)
+RUN ln -sf asterisk /usr/sbin/rasterisk
+
+# Copy Asterisk libraries
+COPY libasteriskssl.so* /lib/
+COPY libasteriskpj.so* /lib/
+
+# Copy Asterisk modules
+# The prepare script now creates asterisk_modules/modules/ directly, so copy it properly
+COPY asterisk_modules/modules /usr/lib/asterisk/modules
+
+# Copy any other directories/files from asterisk_modules (if any)
+# This handles any non-module files that might be in asterisk_modules
+RUN if [ -d /usr/lib/asterisk/asterisk ]; then \
+        echo "Fixing nested asterisk directory structure..."; \
+        cp -r /usr/lib/asterisk/asterisk/* /usr/lib/asterisk/ 2>/dev/null || true; \
+        rm -rf /usr/lib/asterisk/asterisk; \
+    fi
+
+# Ensure res_pjsip.so is present (required for res_pjsip_session.so)
+RUN if [ ! -f /usr/lib/asterisk/modules/res_pjsip.so ]; then \
+        echo "ERROR: res_pjsip.so is missing!"; \
+        exit 1; \
+    else \
+        echo "✓ res_pjsip.so found"; \
+    fi
+
+# Verify critical modules are present
+RUN ls -lh /usr/lib/asterisk/modules/res_pjsip*.so || echo "WARNING: Some PJSIP modules missing"
+
+# Copy sngrep binary (optional - uncomment if you need it and have copied it to build directory)
+# To include sngrep: copy it to build directory first: cp /usr/local/bin/sngrep ~/asterisk-docker-build/sngrep
+# COPY sngrep /usr/local/bin/sngrep
+
+# Copy XML documentation (if prepared by prepare-asterisk-for-docker.sh)
+# This is required for Asterisk to start properly
+COPY xml_docs /tmp/xml_docs
+RUN echo "=== Debug: Checking xml_docs structure ===" && \
+    echo "Contents of /tmp/xml_docs:" && \
+    ls -la /tmp/xml_docs/ 2>/dev/null || echo "  (empty)" && \
+    echo "Looking for thirdparty directory:" && \
+    find /tmp/xml_docs -type d -name "thirdparty" 2>/dev/null && \
+    echo "Looking for opus XML files:" && \
+    find /tmp/xml_docs -name "*opus*" 2>/dev/null && \
+    mkdir -p /var/lib/asterisk/documentation && \
+    find /tmp/xml_docs -maxdepth 1 -name "*.xml" -exec cp {} /var/lib/asterisk/documentation/ \; && \
+    find /tmp/xml_docs -maxdepth 1 -name "*.xslt" -exec cp {} /var/lib/asterisk/documentation/ \; && \
+    find /tmp/xml_docs -maxdepth 1 -name "*.dtd" -exec cp {} /var/lib/asterisk/documentation/ \; && \
+    if [ -d /tmp/xml_docs/documentation ]; then \
+        find /tmp/xml_docs/documentation -maxdepth 1 -name "*.xml" -exec cp {} /var/lib/asterisk/documentation/ \; && \
+        find /tmp/xml_docs/documentation -maxdepth 1 -name "*.xslt" -exec cp {} /var/lib/asterisk/documentation/ \; && \
+        find /tmp/xml_docs/documentation -maxdepth 1 -name "*.dtd" -exec cp {} /var/lib/asterisk/documentation/ \; && \
+        echo "Copied XML files from /tmp/xml_docs/documentation"; \
+    fi && \
+    mkdir -p /var/lib/asterisk/documentation/thirdparty && \
+    if [ -d /tmp/xml_docs/thirdparty ] && [ "$(ls -A /tmp/xml_docs/thirdparty 2>/dev/null)" ]; then \
+        find /tmp/xml_docs/thirdparty -type f -exec cp {} /var/lib/asterisk/documentation/thirdparty/ \; && \
+        echo "Copied thirdparty files from /tmp/xml_docs/thirdparty"; \
+    elif [ -d /tmp/xml_docs/documentation/thirdparty ] && [ "$(ls -A /tmp/xml_docs/documentation/thirdparty 2>/dev/null)" ]; then \
+        find /tmp/xml_docs/documentation/thirdparty -type f -exec cp {} /var/lib/asterisk/documentation/thirdparty/ \; && \
+        echo "Copied thirdparty files from /tmp/xml_docs/documentation/thirdparty"; \
+    else \
+        echo "WARNING: No thirdparty XML documentation found"; \
+    fi && \
+    echo "Thirdparty XML files in container:" && \
+    ls -la /var/lib/asterisk/documentation/thirdparty/ 2>/dev/null || echo "  (directory is empty)" && \
+    rm -rf /tmp/xml_docs
+
+# Copy sound files (if prepared by prepare-asterisk-for-docker.sh)
+COPY sounds /var/lib/asterisk/sounds
+COPY moh /var/lib/asterisk/moh
+
+# Set permissions
+RUN chown -R asterisk:asterisk /usr/sbin/asterisk /usr/sbin/rasterisk /usr/sbin/safe_asterisk
+RUN chown -R asterisk:asterisk /usr/lib/asterisk
+RUN chmod +x /usr/sbin/asterisk /usr/sbin/rasterisk /usr/sbin/safe_asterisk
+# Uncomment if sngrep is included:
+# RUN chmod +x /usr/local/bin/sngrep || true
+
+# Update library cache
+RUN ldconfig
+
+# Configure ODBC for PostgreSQL
+# Find the PostgreSQL ODBC driver location
+RUN if [ -f /usr/lib64/psqlodbcw.so ]; then \
+        DRIVER_PATH="/usr/lib64/psqlodbcw.so"; \
+        SETUP_PATH="/usr/lib64/libodbcpsqlS.so"; \
+    elif [ -f /usr/lib/psqlodbcw.so ]; then \
+        DRIVER_PATH="/usr/lib/psqlodbcw.so"; \
+        SETUP_PATH="/usr/lib/libodbcpsqlS.so"; \
+    elif [ -f /usr/lib64/odbc/psqlodbcw.so ]; then \
+        DRIVER_PATH="/usr/lib64/odbc/psqlodbcw.so"; \
+        SETUP_PATH="/usr/lib64/odbc/libodbcpsqlS.so"; \
+    elif [ -f /usr/lib/odbc/psqlodbcw.so ]; then \
+        DRIVER_PATH="/usr/lib/odbc/psqlodbcw.so"; \
+        SETUP_PATH="/usr/lib/odbc/libodbcpsqlS.so"; \
+    else \
+        echo "WARNING: PostgreSQL ODBC driver not found, searching..."; \
+        find /usr -name "psqlodbcw.so" 2>/dev/null | head -1 || echo "Driver not found"; \
+        DRIVER_PATH=""; \
+        SETUP_PATH=""; \
+    fi && \
+    if [ -n "$DRIVER_PATH" ]; then \
+        echo "[PostgreSQL]" >> /etc/odbcinst.ini && \
+        echo "Description = ODBC for PostgreSQL" >> /etc/odbcinst.ini && \
+        echo "Driver = $DRIVER_PATH" >> /etc/odbcinst.ini && \
+        echo "Setup = $SETUP_PATH" >> /etc/odbcinst.ini && \
+        echo "UsageCount = 2" >> /etc/odbcinst.ini && \
+        echo "ODBC driver configured: $DRIVER_PATH"; \
+    else \
+        echo "WARNING: Could not auto-configure PostgreSQL ODBC driver"; \
+        echo "You may need to manually configure /etc/odbcinst.ini"; \
+    fi
+
+# Create necessary directories
+RUN mkdir -p /var/log/asterisk /var/lib/asterisk /var/spool/asterisk /etc/asterisk
+RUN mkdir -p /var/lib/asterisk/documentation /var/lib/asterisk/sounds /var/lib/asterisk/moh
+RUN chown -R asterisk:asterisk /var/log/asterisk /var/lib/asterisk /var/spool/asterisk /etc/asterisk
+RUN chown -R asterisk:asterisk /var/lib/asterisk/documentation /var/lib/asterisk/sounds /var/lib/asterisk/moh
+
+# Expose ports
+EXPOSE 5060/udp 5060/tcp 5061/udp 5061/tcp 10000-20000/udp
+
+# Start Asterisk automatically, but keep container running if it fails
+CMD ["/bin/bash", "-c", "echo 'Starting Asterisk...'; /usr/sbin/asterisk -f; echo 'Asterisk exited with code $?. Container will remain running for debugging.'; while true; do sleep 30; done"]

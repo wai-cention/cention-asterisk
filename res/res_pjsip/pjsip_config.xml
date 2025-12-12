@@ -1894,6 +1894,74 @@
 						media streams.</para>
 					</description>
 				</configOption>
+				<configOption name="rtp_disconnect_detection" default="no">
+					<since>
+						<version>23.0.0</version>
+					</since>
+					<synopsis>Enable RTP disconnect detection to detect silent termination</synopsis>
+					<description><para>
+						When set to "yes", this endpoint will monitor VOICE frame reception rate
+						to detect when the remote endpoint silently terminates the call without
+						sending a BYE message. If the VOICE frame rate drops below the configured
+						threshold for the configured duration, the call will be automatically
+						terminated.</para>
+						<para>
+						This is useful for handling endpoints like WhatsApp that may silently
+						terminate calls without sending BYE messages, leaving channels in an
+						active state indefinitely.</para>
+						<para>
+						The detection works by monitoring the rate of VOICE frames received over
+						a rolling time window. Normal Opus calls typically receive 40-50 frames
+						per second. When a call is disconnected, VOICE frames stop or drop to
+						near-zero, which triggers the disconnect detection.</para>
+					</description>
+				</configOption>
+				<configOption name="rtp_disconnect_rate_threshold" default="5">
+					<since>
+						<version>23.0.0</version>
+					</since>
+					<synopsis>Minimum VOICE frames per second to consider call active</synopsis>
+					<description><para>
+						The minimum number of VOICE frames per second that must be received to
+						consider the call active. If the frame rate drops below this threshold
+						for the duration specified by <literal>rtp_disconnect_duration</literal>,
+						the call will be terminated.</para>
+						<para>
+						Default is 5 frames per second. Normal Opus calls typically receive
+						40-50 frames per second (20ms frames). After disconnect, VOICE frames
+						typically stop completely or drop to near-zero.</para>
+					</description>
+				</configOption>
+				<configOption name="rtp_disconnect_duration" default="10">
+					<since>
+						<version>23.0.0</version>
+					</since>
+					<synopsis>Duration in seconds that rate threshold must be violated before termination</synopsis>
+					<description><para>
+						The duration in seconds that the VOICE frame rate must remain below
+						<literal>rtp_disconnect_rate_threshold</literal> before the call is
+						terminated. This helps avoid false positives from brief network hiccups
+						or temporary frame interruptions.</para>
+						<para>
+						Default is 10 seconds. The frame rate must be below the threshold for
+						this entire duration before disconnect is detected.</para>
+					</description>
+				</configOption>
+				<configOption name="rtp_disconnect_window" default="10">
+					<since>
+						<version>23.0.0</version>
+					</since>
+					<synopsis>Rolling window size in seconds for calculating frame rate</synopsis>
+					<description><para>
+						The size of the rolling time window in seconds used to calculate the
+						VOICE frame rate. The frame rate is calculated as the number of VOICE
+						frames received in the last N seconds, where N is this value.</para>
+						<para>
+						Default is 10 seconds. A larger window provides more stable rate
+						calculations but may delay detection. A smaller window responds faster
+						but may be more sensitive to brief interruptions.</para>
+					</description>
+				</configOption>
 				<configOption name="ignore_183_without_sdp" default="no">
 					<since>
 						<version>13.26.0</version>

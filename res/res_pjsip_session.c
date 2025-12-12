@@ -68,6 +68,12 @@
 static void handle_session_begin(struct ast_sip_session *session);
 static void handle_session_end(struct ast_sip_session *session);
 static void handle_session_destroy(struct ast_sip_session *session);
+static void rtp_disconnect_cleanup(struct ast_sip_session *session);
+static void rtp_disconnect_stop_timer(struct ast_sip_session *session);
+static int rtp_disconnect_check_task(void *data);
+static void rtp_disconnect_check_cb(pj_timer_heap_t *timer_heap, struct pj_timer_entry *entry);
+static void rtp_disconnect_start_monitoring(struct ast_sip_session *session);
+static void rtp_disconnect_stop_monitoring(struct ast_sip_session *session);
 static void handle_incoming_request(struct ast_sip_session *session, pjsip_rx_data *rdata);
 static void handle_incoming_response(struct ast_sip_session *session, pjsip_rx_data *rdata,
 		enum ast_sip_session_response_priority response_priority);
@@ -3107,6 +3113,9 @@ static void session_destructor(void *obj)
 
 	ast_dsp_free(session->dsp);
 
+	/* Clean up RTP disconnect detection */
+	rtp_disconnect_cleanup(session);
+
 	if (session->inv_session) {
 		struct pjsip_dialog *dlg = session->inv_session->dlg;
 
@@ -3184,6 +3193,9 @@ struct ast_sip_session *ast_sip_session_alloc(struct ast_sip_endpoint *endpoint,
 	if (AST_VECTOR_INIT(&session->media_stats, 1) < 0) {
 		return NULL;
 	}
+
+	/* Initialize RTP disconnect detection stats */
+	memset(&session->rtp_disconnect, 0, sizeof(session->rtp_disconnect));
 
 	if (endpoint->dtmf == AST_SIP_DTMF_INBAND || endpoint->dtmf == AST_SIP_DTMF_AUTO) {
 		dsp_features |= DSP_FEATURE_DIGIT_DETECT;
@@ -4006,6 +4018,222 @@ void ast_sip_session_end_if_deferred(struct ast_sip_session *session)
 		session->ended_while_deferred = 0;
 		session_end(session);
 	}
+}
+
+/*!
+ * \internal
+ * \brief Stop RTP disconnect detection timer if it is still running.
+ */
+static void rtp_disconnect_stop_timer(struct ast_sip_session *session)
+{
+	struct rtp_disconnect_stats *stats = &session->rtp_disconnect;
+
+	if (pj_timer_heap_cancel_if_active(pjsip_endpt_get_timer_heap(ast_sip_get_pjsip_endpoint()),
+		&stats->check_timer, stats->check_timer.id)) {
+		ao2_ref(session, -1);
+	}
+}
+
+/*!
+ * \internal
+ * \brief Clean up RTP disconnect detection resources.
+ */
+static void rtp_disconnect_cleanup(struct ast_sip_session *session)
+{
+	struct rtp_disconnect_stats *stats = &session->rtp_disconnect;
+
+	rtp_disconnect_stop_timer(session);
+	stats->active = 0;
+	stats->enabled = 0;
+
+	if (stats->frame_timestamps) {
+		ast_free(stats->frame_timestamps);
+		stats->frame_timestamps = NULL;
+	}
+	stats->window_size = 0;
+	stats->window_index = 0;
+	stats->frame_count = 0;
+}
+
+/*!
+ * \internal
+ * \brief Task to check RTP frame rate and terminate if disconnected.
+ */
+static int rtp_disconnect_check_task(void *data)
+{
+	struct ast_sip_session *session = data;
+	struct rtp_disconnect_stats *stats = &session->rtp_disconnect;
+	time_t now = time(NULL);
+	double frame_rate = 0.0;
+	time_t elapsed = 0;
+
+	if (!session || !session->endpoint || !stats->enabled || !stats->active) {
+		rtp_disconnect_cleanup(session);
+		ao2_ref(session, -1);
+		return 0;
+	}
+
+	/* Recalculate frame count for current window (frames may have aged out) */
+	time_t window_start = now - stats->window_seconds;
+	unsigned int valid_frames = 0;
+	unsigned int i;
+	
+	if (stats->frame_timestamps) {
+		for (i = 0; i < stats->window_size; i++) {
+			/* Only count non-zero timestamps (initialized entries) within the window */
+			if (stats->frame_timestamps[i] > 0 && stats->frame_timestamps[i] >= window_start) {
+				valid_frames++;
+			}
+		}
+	}
+	stats->frame_count = valid_frames;
+
+	/* Calculate frame rate over the window */
+	if (stats->window_seconds > 0 && stats->frame_count > 0) {
+		frame_rate = (double)stats->frame_count / stats->window_seconds;
+	}
+
+	/* Check if rate is below threshold */
+	if (frame_rate < stats->rate_threshold) {
+		if (stats->disconnect_start_time == 0) {
+			/* Start tracking the low rate period */
+			stats->disconnect_start_time = now;
+			ast_debug(2, "%s: RTP disconnect detection - frame rate %.2f fps below threshold %u fps, starting disconnect timer\n",
+				ast_sip_session_get_name(session), frame_rate, stats->rate_threshold);
+		} else {
+			/* Check if we've been below threshold long enough */
+			elapsed = now - stats->disconnect_start_time;
+			if (elapsed >= stats->duration) {
+				/* Disconnect detected - terminate the call */
+				ast_log(LOG_NOTICE, "%s: Terminating call due to RTP disconnect detection - frame rate %.2f fps below threshold %u fps for %ld seconds\n",
+					ast_sip_session_get_name(session), frame_rate, stats->rate_threshold, (long)elapsed);
+				
+				rtp_disconnect_cleanup(session);
+				
+				if (session->channel) {
+					ast_channel_lock(session->channel);
+					ast_channel_hangupcause_set(session->channel, AST_CAUSE_REQUESTED_CHAN_UNAVAIL);
+					ast_channel_unlock(session->channel);
+					ast_softhangup(session->channel, AST_SOFTHANGUP_DEV);
+				} else if (session->inv_session) {
+					ast_sip_session_terminate(session, 0);
+				}
+				
+				ao2_ref(session, -1);
+				return 0;
+			}
+		}
+	} else {
+		/* Rate is above threshold - reset disconnect timer */
+		if (stats->disconnect_start_time != 0) {
+			ast_debug(2, "%s: RTP disconnect detection - frame rate %.2f fps recovered above threshold %u fps\n",
+				ast_sip_session_get_name(session), frame_rate, stats->rate_threshold);
+			stats->disconnect_start_time = 0;
+		}
+	}
+
+	/* Schedule next check in 1 second */
+	pj_time_val delay = { .sec = 1, .msec = 0 };
+	pj_timer_entry_init(&stats->check_timer, 0, session, rtp_disconnect_check_cb);
+	if (pjsip_endpt_schedule_timer(ast_sip_get_pjsip_endpoint(), &stats->check_timer, &delay) != PJ_SUCCESS) {
+		ast_log(LOG_WARNING, "%s: Failed to schedule RTP disconnect check timer\n",
+			ast_sip_session_get_name(session));
+		rtp_disconnect_cleanup(session);
+		ao2_ref(session, -1);
+		return 0;
+	}
+
+	return 0;
+}
+
+/*!
+ * \internal
+ * \brief Timer callback for RTP disconnect detection check.
+ */
+static void rtp_disconnect_check_cb(pj_timer_heap_t *timer_heap, struct pj_timer_entry *entry)
+{
+	struct ast_sip_session *session = entry->user_data;
+
+	if (ast_sip_push_task(session->serializer, rtp_disconnect_check_task, session)) {
+		ao2_cleanup(session);
+	}
+}
+
+/*!
+ * \internal
+ * \brief Start RTP disconnect detection monitoring.
+ */
+static void rtp_disconnect_start_monitoring(struct ast_sip_session *session)
+{
+	struct rtp_disconnect_stats *stats = &session->rtp_disconnect;
+	unsigned int window_size;
+	pj_time_val delay = { .sec = 1, .msec = 0 };
+
+	if (!session || !session->endpoint || !session->endpoint->rtp_disconnect_detection) {
+		return;
+	}
+
+	/* Already active */
+	if (stats->active) {
+		return;
+	}
+
+	/* Initialize stats from endpoint configuration */
+	stats->enabled = 1;
+	stats->rate_threshold = session->endpoint->rtp_disconnect_rate_threshold;
+	stats->duration = session->endpoint->rtp_disconnect_duration;
+	stats->window_seconds = session->endpoint->rtp_disconnect_window;
+
+	/* Allocate circular buffer for frame timestamps */
+	/* Window size = window_seconds * max_frames_per_second (assume 50 fps for Opus) */
+	window_size = stats->window_seconds * 50;
+	if (window_size < 100) {
+		window_size = 100; /* Minimum buffer size */
+	}
+	if (window_size > 1000) {
+		window_size = 1000; /* Maximum buffer size */
+	}
+
+	stats->frame_timestamps = ast_calloc(window_size, sizeof(time_t));
+	if (!stats->frame_timestamps) {
+		ast_log(LOG_WARNING, "%s: Failed to allocate RTP disconnect detection buffer\n",
+			ast_sip_session_get_name(session));
+		stats->enabled = 0;
+		return;
+	}
+
+	stats->window_size = window_size;
+	stats->window_index = 0;
+	stats->frame_count = 0;
+	stats->last_voice_frame_time = 0;
+	stats->disconnect_start_time = 0;
+	stats->active = 1;
+
+	ast_debug(2, "%s: Started RTP disconnect detection (threshold=%u fps, duration=%u s, window=%u s)\n",
+		ast_sip_session_get_name(session), stats->rate_threshold, stats->duration, stats->window_seconds);
+
+	/* Schedule first check in 1 second */
+	ao2_ref(session, +1);
+	pj_timer_entry_init(&stats->check_timer, 0, session, rtp_disconnect_check_cb);
+	if (pjsip_endpt_schedule_timer(ast_sip_get_pjsip_endpoint(), &stats->check_timer, &delay) != PJ_SUCCESS) {
+		ast_log(LOG_WARNING, "%s: Failed to schedule RTP disconnect check timer\n",
+			ast_sip_session_get_name(session));
+		rtp_disconnect_cleanup(session);
+		ao2_ref(session, -1);
+	}
+}
+
+/*!
+ * \internal
+ * \brief Stop RTP disconnect detection monitoring.
+ */
+static void rtp_disconnect_stop_monitoring(struct ast_sip_session *session)
+{
+	if (!session) {
+		return;
+	}
+
+	rtp_disconnect_cleanup(session);
 }
 
 struct ast_sip_session *ast_sip_dialog_get_session(pjsip_dialog *dlg)
@@ -5532,6 +5760,20 @@ static void session_inv_on_state_changed(pjsip_inv_session *inv, pjsip_event *e)
 		break;
 	}
 
+	/* Start/stop RTP disconnect detection monitoring based on session state */
+	if (session && session->endpoint && session->endpoint->rtp_disconnect_detection) {
+		if (inv->state == PJSIP_INV_STATE_CONFIRMED || inv->state == PJSIP_INV_STATE_CONNECTING) {
+			/* Start monitoring when session reaches CONFIRMED or CONNECTING state with active media */
+			struct ast_sip_session_media *audio_media = NULL;
+			if (session->active_media_state) {
+				audio_media = session->active_media_state->default_session[AST_MEDIA_TYPE_AUDIO];
+			}
+			if (audio_media && audio_media->rtp) {
+				rtp_disconnect_start_monitoring(session);
+			}
+		}
+	}
+
 	if (inv->state == PJSIP_INV_STATE_DISCONNECTED) {
 		/* Check if this endpoint expects no ACK and has active RTP */
 		if (session) {
@@ -5573,10 +5815,14 @@ static void session_inv_on_state_changed(pjsip_inv_session *inv, pjsip_event *e)
 					ast_debug(1, "%s: Endpoint expects no ACK and RTP/channel is active, continuing call without ACK\n",
 						ast_sip_session_get_name(session));
 					/* Don't terminate the session - let it continue */
+					/* Keep RTP disconnect monitoring active since session is continuing */
 					SCOPE_EXIT_RTN("Continuing without ACK due to active RTP/channel\n");
 				}
 			}
 		}
+		
+		/* Stop RTP disconnect monitoring only if session is actually ending */
+		rtp_disconnect_stop_monitoring(session);
 		
 		if (session->defer_end) {
 			ast_debug(3, "%s: Deferring session end\n", ast_sip_session_get_name(session));
