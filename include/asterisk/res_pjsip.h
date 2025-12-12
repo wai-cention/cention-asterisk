@@ -1090,6 +1090,14 @@ struct ast_sip_endpoint {
 	);
 	/*! Whether to expect ACK for incoming INVITE (for WhatsApp compatibility) */
 	unsigned int expect_no_ack;
+	/*! Enable RTP disconnect detection (monitor VOICE frame rate to detect silent termination) */
+	unsigned int rtp_disconnect_detection;
+	/*! Minimum VOICE frames per second to consider call active (default: 5) */
+	unsigned int rtp_disconnect_rate_threshold;
+	/*! Duration in seconds that rate threshold must be violated before termination (default: 10) */
+	unsigned int rtp_disconnect_duration;
+	/*! Rolling window size in seconds for calculating frame rate (default: 10) */
+	unsigned int rtp_disconnect_window;
 	/*! Configuration for extensions */
 	struct ast_sip_endpoint_extensions extensions;
 	/*! Configuration relating to media */

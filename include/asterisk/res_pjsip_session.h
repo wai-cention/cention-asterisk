@@ -171,6 +171,43 @@ enum ast_sip_session_call_direction {
 };
 
 /*!
+ * \brief Structure for tracking RTP frame rate to detect disconnection
+ * 
+ * This structure tracks VOICE frame reception rate over a rolling time window
+ * to detect when WhatsApp (or other endpoints) silently terminate calls
+ * without sending BYE messages.
+ */
+struct rtp_disconnect_stats {
+	/*! Circular buffer of VOICE frame timestamps */
+	time_t *frame_timestamps;
+	/*! Number of timestamps in the circular buffer */
+	unsigned int window_size;
+	/*! Current position in the circular buffer */
+	unsigned int window_index;
+	/*! Total frames in current window */
+	unsigned int frame_count;
+	
+	/*! Time of last VOICE frame received */
+	time_t last_voice_frame_time;
+	/*! When low rate period started (for disconnect detection) */
+	time_t disconnect_start_time;
+	
+	/*! Is detection enabled for this session? */
+	unsigned int enabled:1;
+	/*! Minimum frames per second to consider call active */
+	unsigned int rate_threshold;
+	/*! Duration in seconds that rate threshold must be violated before termination */
+	unsigned int duration;
+	/*! Window size in seconds for calculating frame rate */
+	unsigned int window_seconds;
+	
+	/*! Is monitoring currently active? */
+	unsigned int active:1;
+	/*! Timer entry for periodic rate checking */
+	pj_timer_entry check_timer;
+};
+
+/*!
  * \brief A structure describing a SIP session
  *
  * For the sake of brevity, a "SIP session" in Asterisk is referring to
@@ -247,6 +284,8 @@ struct ast_sip_session {
 	enum ast_sip_session_call_direction call_direction;
 	/*! Originating Line Info (ANI II digits) */
 	int ani2;
+	/*! RTP disconnect detection statistics */
+	struct rtp_disconnect_stats rtp_disconnect;
 };
 
 typedef int (*ast_sip_session_request_creation_cb)(struct ast_sip_session *session, pjsip_tx_data *tdata);
